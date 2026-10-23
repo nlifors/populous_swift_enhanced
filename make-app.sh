@@ -7,7 +7,10 @@ swift build -c release --product Populous
 APP=Populous.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$(swift build -c release --show-bin-path)/Populous" "$APP/Contents/MacOS/Populous"
+BIN="$(swift build -c release --show-bin-path)"
+cp "$BIN/Populous" "$APP/Contents/MacOS/Populous"
+# The HD models (made by Assets/blender/build_assets.py).
+cp -R "$BIN/Populous_PopulousHD.bundle" "$APP/Contents/Resources/"
 # The Dock and Finder icon; tools/make-icon.py redraws it.
 cp Populous.icns "$APP/Contents/Resources/Populous.icns"
 cat > "$APP/Contents/Info.plist" <<'PLIST'

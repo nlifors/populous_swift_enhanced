@@ -1,7 +1,9 @@
 import AppKit
+import MetalKit
 import PopulousAssets
 import PopulousAudio
 import PopulousCore
+import PopulousHD
 import PopulousRender
 
 /// Shows the game screen and lets you look around a generated world.
@@ -9,9 +11,32 @@ import PopulousRender
 /// the board's arrows, behaviour, power and magnet icons work; clicking the minimap jumps
 /// there. Arrow keys also scroll, [ and ] change world, M and S switch the music
 /// and the sound effects on and off.
-final class GameView: NSView {
+final class GameView: NSView, MTKViewDelegate {
     let assets: GameAssets
     let renderer: Renderer
+    /// Puts frames on the screen with Metal, in classic or HD graphics.
+    let screenRenderer: ScreenRenderer
+    /// HD graphics (a work in progress) instead of the original's pictures. Tab
+    /// switches between them at any moment; the game itself is the same either way.
+    var hdGraphics = UserDefaults.standard.bool(forKey: "hdGraphics") {
+        didSet {
+            UserDefaults.standard.set(hdGraphics, forKey: "hdGraphics")
+            needsDisplay = true
+        }
+    }
+    let startTime = Date()
+    /// The Metal surface filling the view; this view handles the input.
+    let metalView: MetalSurface
+
+    /// Every change that asks for a redraw also redraws the Metal surface. (This
+    /// view paints nothing itself, so AppKit drops the flag; pass it on as set.)
+    override var needsDisplay: Bool {
+        get { super.needsDisplay }
+        set {
+            super.needsDisplay = newValue
+            if newValue { metalView.needsDisplay = true }
+        }
+    }
     var worldNumber = 0
     var world: World
     /// Nil if the Mac's audio could not be started; the game then runs silent.
@@ -21,13 +46,23 @@ final class GameView: NSView {
     var viewX = 0
     var viewY = 0
 
-    init(assets: GameAssets) {
+    init(assets: GameAssets, screenRenderer: ScreenRenderer) {
         self.assets = assets
+        self.screenRenderer = screenRenderer
         renderer = Renderer(assets: assets)
         world = World(random: GameRandom(seed: 0))
         // POPULOUS_SILENT=1 runs without opening the audio output.
         audio = ProcessInfo.processInfo.environment["POPULOUS_SILENT"] == nil ? AudioOutput(music: assets.music, speech: assets.speech) : nil
+        metalView = MetalSurface(frame: NSRect(x: 0, y: 0, width: 960, height: 600), device: screenRenderer.device)
         super.init(frame: NSRect(x: 0, y: 0, width: 960, height: 600))
+        // Frames are drawn when something changes, not on a timer of the view's own.
+        metalView.colorPixelFormat = ScreenRenderer.pixelFormat
+        metalView.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+        metalView.enableSetNeedsDisplay = true
+        metalView.isPaused = true
+        metalView.delegate = self
+        metalView.autoresizingMask = [.width, .height]
+        addSubview(metalView)
         loadWorld(0)
         // The title waits a few seconds, then runs the demo until a click or key.
         Timer.scheduledTimer(withTimeInterval: TitleDemo.stepSeconds, repeats: true) { [weak self] _ in
@@ -460,67 +495,102 @@ final class GameView: NSView {
         }
     }
 
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor.black.setFill()
-        bounds.fill()
-        // Light the icon for what a click in the view will do, the current behaviour,
-        // and the sound and pause switches.
-        let cursorIcon = inspecting ? (6, 0) : placingMagnet ? (6, 2) : placingSwamp ? (2, 2) : (6, 1)
-        let behaviourIcon = [(3, 3), (4, 3), (5, 3), (4, 4)][Int(world.players[0].mode) & 3]
-        var sideIcons: [(Int, Int)] = []
-        if musicOn { sideIcons.append((0, 3)) }
-        if effectsOn { sideIcons.append((0, 4)) }
-        if paused { sideIcons.append((1, 3)) }
-        var image = renderer.frame(
-            world: world, terrain: terrain, viewX: viewX, viewY: viewY, phase: world.phase,
-            litIcons: [cursorIcon, behaviourIcon], litSideIcons: sideIcons)
-        drawOverlay(into: &image)
+    /// What is on the screen now, ready for the GPU.
+    func displayFrame() -> DisplayFrame {
         var palette = assets.gamePalette
-        if case .lord(let speech, let lines, _) = overlay {
+        var image: IndexedImage
+        var closeUp: CloseUp?
+        var over: [UInt8]?
+        // The dialog box, if any; in HD it goes over the close-up.
+        var dialog = IndexedImage(width: 320, height: 200, fill: IndexedImage.transparent)
+        drawOverlay(into: &dialog)
+        switch overlay {
+        case .lord(let speech, let lines, _):
             image = renderer.lordScreen(lines: lines, mouth: speech.mouth, eyes: speech.eyesDrawn)
             palette = assets.lord.palette
-        }
-        if case .title = overlay {
+        case .title:
             image = assets.title.image
             palette = assets.title.palette
+        case .demo where demoScreen != nil:
+            image = demoScreen!
+        default:
+            // Light the icon for what a click in the view will do, the current
+            // behaviour, and the sound and pause switches.
+            let cursorIcon = inspecting ? (6, 0) : placingMagnet ? (6, 2) : placingSwamp ? (2, 2) : (6, 1)
+            let behaviourIcon = [(3, 3), (4, 3), (5, 3), (4, 4)][Int(world.players[0].mode) & 3]
+            var sideIcons: [(Int, Int)] = []
+            if musicOn { sideIcons.append((0, 3)) }
+            if effectsOn { sideIcons.append((0, 4)) }
+            if paused { sideIcons.append((1, 3)) }
+            image = renderer.frame(
+                world: world, terrain: terrain, viewX: viewX, viewY: viewY, phase: world.phase,
+                litIcons: [cursorIcon, behaviourIcon], litSideIcons: sideIcons, closeUp: !hdGraphics)
+            if hdGraphics {
+                closeUp = renderer.closeUp(world: world, viewX: viewX, viewY: viewY, phase: world.phase)
+                if overlay != nil { over = dialog.rgba(palette: palette) }
+            } else {
+                image.draw(dialog, x: 0, y: 0)
+            }
         }
-        if case .demo = overlay, let demoScreen { image = demoScreen }
-        var pixels = image.rgba(palette: palette)
         // The pointer is a hardware sprite in the original: it takes its colours
         // from the upper half of the palette, which only the title picture changes.
         if let pointer {
+            var layer = over ?? [UInt8](repeating: 0, count: 320 * 200 * 4)
             var colors = assets.gamePalette.colors
             if case .title = overlay, palette.colors.count >= 32 { colors = Array(palette.colors[16...]) }
             let sprite = assets.sprites[pointerSprite]
-            for sy in 0..<sprite.height where (0..<image.height).contains(pointer.y + sy) {
-                for sx in 0..<sprite.width where (0..<image.width).contains(pointer.x + sx) {
+            for sy in 0..<sprite.height where (0..<200).contains(pointer.y + sy) {
+                for sx in 0..<sprite.width where (0..<320).contains(pointer.x + sx) {
                     let p = Int(sprite[sx, sy])
                     guard p < colors.count else { continue }
-                    let o = ((pointer.y + sy) * image.width + pointer.x + sx) * 4
-                    pixels[o] = colors[p].r
-                    pixels[o + 1] = colors[p].g
-                    pixels[o + 2] = colors[p].b
+                    let o = ((pointer.y + sy) * 320 + pointer.x + sx) * 4
+                    layer[o] = colors[p].r
+                    layer[o + 1] = colors[p].g
+                    layer[o + 2] = colors[p].b
+                    layer[o + 3] = 255
                 }
             }
+            over = layer
         }
-        let rgba = Data(pixels)
-        guard
-            let provider = CGDataProvider(data: rgba as CFData),
-            let cgImage = CGImage(
-                width: image.width, height: image.height, bitsPerComponent: 8, bitsPerPixel: 32,
-                bytesPerRow: image.width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
-                provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent),
-            let context = NSGraphicsContext.current?.cgContext
-        else { return }
-        context.interpolationQuality = .none
-        // The view is flipped; flip back so the image is not drawn upside down.
+        var frame = DisplayFrame(
+            under: image.rgba(palette: palette), over: over, closeUp: closeUp, terrain: terrain,
+            time: Date().timeIntervalSince(startTime))
+        frame.underWidth = image.width
+        frame.underHeight = image.height
+        return frame
+    }
+
+    /// The game screen's place in the drawable, in its pixels.
+    func screenRectInPixels(drawableWidth: CGFloat) -> CGRect {
+        let scale = bounds.width > 0 ? drawableWidth / bounds.width : 1
         let rect = screenRect
-        context.saveGState()
-        context.translateBy(x: rect.minX, y: rect.maxY)
-        context.scaleBy(x: 1, y: -1)
-        context.draw(cgImage, in: CGRect(origin: .zero, size: rect.size))
-        context.restoreGState()
+        return CGRect(x: rect.minX * scale, y: rect.minY * scale, width: rect.width * scale, height: rect.height * scale)
+    }
+
+    func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+
+    func draw(in view: MTKView) {
+        guard let drawable = view.currentDrawable else { return }
+        screenRenderer.present(
+            displayFrame(), to: drawable, target: drawable.texture,
+            screen: screenRectInPixels(drawableWidth: CGFloat(drawable.texture.width)))
+    }
+
+    /// A picture of the window's contents at full resolution, for screenshots.
+    func snapshot() -> NSBitmapImageRep? {
+        let scale = window?.backingScaleFactor ?? 2
+        let width = Int(bounds.width * scale), height = Int(bounds.height * scale)
+        guard width > 0, height > 0,
+            let image = screenRenderer.snapshot(
+                displayFrame(), width: width, height: height,
+                screen: screenRectInPixels(drawableWidth: CGFloat(width)))
+        else { return nil }
+        return NSBitmapImageRep(cgImage: image)
+    }
+
+    @objc func toggleGraphics(_ sender: Any?) {
+        hdGraphics.toggle()
+        notify(hdGraphics ? "HD graphics (early preview) - Tab switches back" : "Classic graphics - Tab switches to HD")
     }
 
     @objc func saveGame(_ sender: Any?) {
@@ -569,6 +639,7 @@ final class GameView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if event.keyCode == 48 { return toggleGraphics(nil) }  // Tab, anywhere
         if overlay != nil { return dialogKey(event) }
         switch event.keyCode {
         case 123: centerView(x: viewX + 3, y: viewY + 4)  // left
@@ -889,6 +960,11 @@ final class GameView: NSView {
     }
 }
 
+/// The Metal view inside `GameView`. Clicks and keys pass through it to the game.
+final class MetalSurface: MTKView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 /// The disk image: first argument, else the one used last time, else an .adf in the
 /// current directory or beside the app, else ask. The choice is remembered.
 @MainActor func findDisk() -> URL? {
@@ -934,7 +1010,17 @@ do {
 let window = NSWindow(
     contentRect: NSRect(x: 0, y: 0, width: 960, height: 600),
     styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-let view = GameView(assets: assets)
+let screenRenderer: ScreenRenderer
+do {
+    screenRenderer = try ScreenRenderer(assets: assets)
+} catch {
+    let alert = NSAlert()
+    alert.messageText = "Could not start the graphics"
+    alert.informativeText = "\(error)"
+    alert.runModal()
+    exit(1)
+}
+let view = GameView(assets: assets, screenRenderer: screenRenderer)
 window.contentView = view
 window.contentMinSize = NSSize(width: 320, height: 200)
 window.center()
@@ -1005,8 +1091,7 @@ if ProcessInfo.processInfo.environment["POPULOUS_SELFTEST"] != nil {
     if let folder = ProcessInfo.processInfo.environment["POPULOUS_SHOTS"] {
         func shot(_ name: String) {
             view.pointer = (200, 120)
-            guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
-            view.cacheDisplay(in: view.bounds, to: rep)
+            guard let rep = view.snapshot() else { return }
             try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: folder + "/" + name + ".png"))
         }
         view.paused = false
@@ -1066,7 +1151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 let delegate = AppDelegate()
 app.delegate = delegate
 
-// A minimal menu bar: quit, save and open, full screen.
+// A minimal menu bar: quit, save and open, graphics, full screen.
 let menuBar = NSMenu()
 let appMenu = NSMenu()
 appMenu.addItem(withTitle: "Quit Populous", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -1074,9 +1159,12 @@ let fileMenu = NSMenu(title: "Game")
 fileMenu.addItem(withTitle: "New Game…", action: #selector(GameView.newGame(_:)), keyEquivalent: "n").target = view
 fileMenu.addItem(withTitle: "Open Saved Game…", action: #selector(GameView.openGame(_:)), keyEquivalent: "o").target = view
 fileMenu.addItem(withTitle: "Save Game…", action: #selector(GameView.saveGame(_:)), keyEquivalent: "s").target = view
+let viewMenu = NSMenu(title: "View")
+// Tab does the same; the menu shows which graphics are on.
+viewMenu.addItem(withTitle: "HD Graphics", action: #selector(GameView.toggleGraphics(_:)), keyEquivalent: "").target = view
 let windowMenu = NSMenu(title: "Window")
 windowMenu.addItem(withTitle: "Enter Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
-for menu in [appMenu, fileMenu, windowMenu] {
+for menu in [appMenu, fileMenu, viewMenu, windowMenu] {
     let item = NSMenuItem()
     item.submenu = menu
     menuBar.addItem(item)

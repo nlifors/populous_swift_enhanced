@@ -8,8 +8,7 @@ import PopulousRender
 @MainActor func takeManualShots(view: GameView, window: NSWindow, folder: String) {
     func shot(_ name: String, pointer: (Int, Int)? = (200, 120)) {
         view.pointer = pointer
-        guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
-        view.cacheDisplay(in: view.bounds, to: rep)
+        guard let rep = view.snapshot() else { return }
         try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: folder + "/" + name + ".png"))
         print("shot \(name)")
     }

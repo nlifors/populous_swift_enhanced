@@ -21,12 +21,19 @@ let package = Package(
         .target(name: "PopulousCore"),
         .target(name: "PopulousRender", dependencies: ["PopulousAssets", "PopulousCore"]),
         .target(name: "PopulousAudio", dependencies: ["PopulousAssets"]),
+        .target(
+            name: "PopulousHD", dependencies: ["PopulousAssets", "PopulousCore", "PopulousRender"],
+            resources: [.copy("Resources/Models"), .copy("Resources/Textures")]),
         .executableTarget(
             name: "popassets", dependencies: ["PopulousAssets", "PopulousCore", "PopulousRender", "PopulousAudio"]),
         .executableTarget(
-            name: "Populous", dependencies: ["PopulousAssets", "PopulousCore", "PopulousRender", "PopulousAudio"]),
+            name: "Populous",
+            dependencies: ["PopulousAssets", "PopulousCore", "PopulousRender", "PopulousAudio", "PopulousHD"]),
         .testTarget(name: "PopulousAssetsTests", dependencies: ["PopulousAssets"], swiftSettings: testSettings),
         .testTarget(name: "PopulousCoreTests", dependencies: ["PopulousCore"], swiftSettings: testSettings),
         .testTarget(name: "PopulousAudioTests", dependencies: ["PopulousAudio"], swiftSettings: testSettings),
+        .testTarget(
+            name: "PopulousRenderTests", dependencies: ["PopulousAssets", "PopulousCore", "PopulousRender", "PopulousHD"],
+            swiftSettings: testSettings),
     ]
 )

@@ -2,7 +2,8 @@ import PopulousAssets
 import PopulousCore
 
 /// Draws the game screen the way the original does: board picture, minimap, then
-/// the 8x8-cell isometric close-up, all into one 320x200 indexed image.
+/// the 8x8-cell isometric close-up, all into one 320x200 indexed image. The
+/// close-up is worked out as a `CloseUp` first, which other renderers can draw too.
 public struct Renderer: Sendable {
     /// Cells per side of the close-up view.
     public static let viewSize = 8
@@ -116,10 +117,11 @@ public struct Renderer: Sendable {
     /// One frame. `viewX`/`viewY` is the map cell at the top corner of the close-up;
     /// `phase` (0 or 1) flips every frame and drives the two-frame animations.
     /// `litIcons` and `litSideIcons` are icons (column, row) on the two panels to
-    /// show as switched on.
+    /// show as switched on. With `closeUp` false the close-up is left out, for a
+    /// renderer that draws it separately.
     public func frame(
         world: World, terrain: Int, viewX: Int, viewY: Int, phase: Int = 0,
-        litIcons: [(Int, Int)] = [], litSideIcons: [(Int, Int)] = []
+        litIcons: [(Int, Int)] = [], litSideIcons: [(Int, Int)] = [], closeUp includeCloseUp: Bool = true
     ) -> IndexedImage {
         let land = assets.landSets[terrain]
         var screen = assets.board.image
@@ -127,7 +129,9 @@ public struct Renderer: Sendable {
         drawViewMarker(viewX: viewX, viewY: viewY, into: &screen)
         drawMinimapPeople(world, phase: phase, into: &screen)
         drawManaPointer(world, into: &screen)
-        drawView(world, land: land, viewX: viewX, viewY: viewY, phase: phase, into: &screen)
+        if includeCloseUp {
+            draw(closeUp(world: world, viewX: viewX, viewY: viewY, phase: phase), land: land, into: &screen)
+        }
         drawShield(world, land: land, phase: phase, into: &screen)
         drawPopulationBars(world, into: &screen)
         lightIcons(litIcons, side: litSideIcons, into: &screen)
@@ -311,68 +315,6 @@ public struct Renderer: Sendable {
         }
     }
 
-    /// The isometric close-up ($69AF6). Cells are drawn back to front with no
-    /// clipping against the board; raised land simply overlaps the frame.
-    func drawView(
-        _ world: World, land: LandSet, viewX: Int, viewY: Int, phase: Int,
-        into screen: inout IndexedImage
-    ) {
-        var sprites: [(x: Int, y: Int, sprite: Int)] = []
-        func drawTile(_ tile: Int, cx: Int, cy: Int, lift: Int) {
-            screen.draw(
-                land.tiles[tile],
-                x: Self.viewOriginX + 16 * cx - 16 * cy,
-                y: Self.viewOriginY + 8 * cx + 8 * cy - lift)
-        }
-
-        for cy in 0..<Self.viewSize {
-            for cx in 0..<Self.viewSize {
-                let cell = viewX + cx + (viewY + cy) * World.size
-                var tile = Int(world.tile[cell])
-                if tile == 0, phase == 0 { tile = 16 }
-                let lift = Int(world.height[cell]) * 8
-                drawTile(tile, cx: cx, cy: cy, lift: lift)
-                // Anything standing on the cell is drawn one step higher.
-                let object = Int(world.object[cell])
-                if object != 0 { drawTile(object, cx: cx, cy: cy, lift: lift + 8) }
-                if cell == world.skullCell { drawTile(Self.skullTile, cx: cx, cy: cy, lift: lift + 8) }
-                if cell == world.ankhCell { drawTile(Self.ankhTile, cx: cx, cy: cy, lift: lift + 8) }
-                let who = Int(world.who[cell])
-                if who != 0 {
-                    queuePerson(world, index: who - 1, cx: cx, cy: cy, lift: lift + 8, phase: phase, into: &sprites)
-                }
-            }
-        }
-
-        // Cliff faces: one 8-pixel slab per height step under the view's two lower
-        // edges, first down the right edge, then back up the left.
-        var x = Self.viewOriginX + 128
-        var y = Self.viewOriginY + 64
-        for row in 0..<Self.viewSize {
-            let cell = viewX + 7 + (viewY + row) * World.size
-            for step in 0..<Int(world.height[cell]) {
-                screen.draw(assets.sprites[Self.rightCliffSprite], x: x, y: y - 8 * step)
-            }
-            x -= 16
-            y += 8
-        }
-        y -= 8
-        for column in (0..<Self.viewSize).reversed() {
-            let cell = viewX + column + (viewY + 7) * World.size
-            for step in 0..<Int(world.height[cell]) {
-                screen.draw(assets.sprites[Self.leftCliffSprite], x: x, y: y - 8 * step)
-            }
-            x -= 16
-            y -= 8
-        }
-
-        // People go on last, in the order their cells were visited. The original's
-        // sprite routine drops anything that starts above the screen.
-        for entry in sprites where entry.y >= 0 {
-            screen.draw(assets.sprites[entry.sprite], x: entry.x, y: entry.y)
-        }
-    }
-
     /// Per walking direction (as a cell offset): the pixel step per animation frame,
     /// the first sprite of that direction, and which view edges the walker must not
     /// be on once it is more than half way out of its cell.
@@ -387,15 +329,15 @@ public struct Renderer: Sendable {
         -1: (-2, -1, 14, [(0, -1)]),
     ]
 
-    /// Works out the sprite and position for the person on a view cell ($69D20).
-    func queuePerson(
-        _ world: World, index: Int, cx: Int, cy: Int, lift: Int, phase: Int,
-        into sprites: inout [(x: Int, y: Int, sprite: Int)]
-    ) {
+    /// Works out the sprite and position for the person on a view cell, and the
+    /// marks they carry ($69D20).
+    func figures(_ world: World, index: Int, cx: Int, cy: Int, lift: Int, phase: Int) -> [CloseUp.Figure] {
         let person = world.people[index]
         var x = 16 * cx - 16 * cy
         var y = 8 * cx + 8 * cy - lift
         let sprite: Int
+        let kind: CloseUp.Figure.Kind
+        var walk: CloseUp.Figure.Walk?
 
         let state = person.state
         let armed = person.long14 != 0
@@ -405,60 +347,76 @@ public struct Renderer: Sendable {
             x += 0xC0
             y += 0x40
             sprite = 0x40 + phase + (second ? 2 : 0)
+            kind = .flag
         } else if state == Person.State.walking || state & Person.State.drowning != 0 {
             let frame = Int(person.frame)
-            guard frame < 8 else { return }
+            guard frame < 8 else { return [] }
             let cell = Int(person.cell)
             let direction = Int(person.direction)
             // Climb or descend gradually towards the cell being walked to.
             let target = cell + direction
+            var climb = 0
             if world.height.indices.contains(target) {
-                y += (Int(world.height[cell]) - Int(world.height[target])) * frame
+                climb = Int(world.height[target]) - Int(world.height[cell])
+                y -= climb * frame
             }
             if world.tile[cell] != World.Tile.flat { y += 4 }
             var step = (dx: 0, dy: 0)
             var base = 8
             if let walk = Self.walks[direction] {
-                if frame > 4, walk.edges.contains(where: { ($0.0 == cx) || ($0.1 == cy) }) { return }
+                if frame > 4, walk.edges.contains(where: { ($0.0 == cx) || ($0.1 == cy) }) { return [] }
                 step = (walk.dx, walk.dy)
                 base = walk.sprite
             }
             if state & Person.State.drowning != 0 {
                 sprite = 0x5D + Int(world.tick & 3) + (armed ? 0x10 : 0) + (second ? 4 : 0)
             } else {
-                sprite = base + (person.long14 >> 16 != 0 ? 0x20 : 0) + (second ? 0x10 : 0) + phase
+                let knight = person.long14 >> 16 != 0
+                sprite = base + (knight ? 0x20 : 0) + (second ? 0x10 : 0) + phase
+                walk = CloseUp.Figure.Walk(direction: direction, frame: frame, climb: climb, knight: knight)
             }
             x += step.dx * frame + 0xB8
             y += step.dy * frame + 0x40
+            kind = .person
         } else if state & 0x60 != 0 {
             // Stopped to greet a passer-by.
             x += 0xC0
             y += 0x40
             sprite = Int(person.frame) + (armed ? 0x18 : 0) + (second ? 2 : 0)
+            kind = .person
         } else if state & Person.State.fighting != 0 {
             x += 0xC0
             y += 0x40
             sprite = Int(person.frame)
+            kind = .person
         } else if state & 0x80 != 0 {
             // A burning ruin.
             x += 0xB8
             y += 0x40
             sprite = 0x69 + Int(world.tick & 3)
+            kind = .person
         } else {
             // Celebrating a win.
             x += 0xC0
             y += 0x40
             sprite = Int(person.frame) + (armed ? 0x20 : 0) + (second ? 4 : 0)
+            kind = .person
         }
-        guard assets.sprites.indices.contains(sprite) else { return }
+        guard assets.sprites.indices.contains(sprite) else { return [] }
 
-        sprites.append((x, y, sprite))
-        // The person being followed carries a small shield.
-        if world.selectedPerson == index + 1 { sprites.append((x + 8, y, 0x44)) }
-        // The leader carries its side's symbol.
         let owner = Int(person.owner)
-        if world.players[owner].leader == Int16(index + 1) {
-            sprites.append((x + 8, y, 0x4A + owner))
+        func figure(x: Int, sprite: Int, kind: CloseUp.Figure.Kind) -> CloseUp.Figure {
+            CloseUp.Figure(
+                x: x, y: y, sprite: sprite, kind: kind, person: index, cx: cx, cy: cy, side: owner,
+                walk: kind == .person ? walk : nil)
         }
+        var figures = [figure(x: x, sprite: sprite, kind: kind)]
+        // The person being followed carries a small shield.
+        if world.selectedPerson == index + 1 { figures.append(figure(x: x + 8, sprite: 0x44, kind: .followedMark)) }
+        // The leader carries its side's symbol.
+        if world.players[owner].leader == Int16(index + 1) {
+            figures.append(figure(x: x + 8, sprite: 0x4A + owner, kind: .leaderMark))
+        }
+        return figures
     }
 }

@@ -186,6 +186,7 @@ The options can be looked at in any game but only changed in a custom game.
 | ⌘S / ⌘O | Save / open a saved game |
 | ⌘F | Full screen |
 | [ and ] | Previous / next world (not in the original) |
+| Tab | Switch between the original graphics and the HD graphics (not in the original; HD is an early preview) |
 
 ## How the port was made
 
@@ -198,7 +199,8 @@ code tested against those recordings.
 |---|---|
 | `Sources/PopulousAssets` | Reads the disk image and decodes graphics, sounds, levels and text |
 | `Sources/PopulousCore` | The game rules: world, people, powers, computer opponent, conquest, saves |
-| `Sources/PopulousRender` | Draws the game screen, shield and dialogs |
+| `Sources/PopulousRender` | Draws the game screen, shield and dialogs; works out what the close-up shows (`CloseUp`) |
+| `Sources/PopulousHD` | Puts frames on the screen with Metal, and draws the close-up in 3D for the HD graphics |
 | `Sources/PopulousAudio` | The original's music and effects sequencer |
 | `Sources/Populous` | The Mac app |
 | `Sources/popassets` | A command-line tool to list, extract and render the disk's contents |
